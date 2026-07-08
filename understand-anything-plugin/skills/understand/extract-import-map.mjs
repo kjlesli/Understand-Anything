@@ -37,6 +37,29 @@ import { createRequire } from 'node:module';
 import { dirname, resolve, join, posix } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+
+/**
+ * Read a list of files concurrently while preserving result order. Failures
+ * are returned in-place as `{ raw: null, err }` so callers can emit the same
+ * per-file warnings they did under the previous sequential `readFileSync`
+ * loops.
+ *
+ * `paths` is a list of `{ key, absPath }` pairs; `key` is whatever the caller
+ * wants to attach the result to (typically a project-relative POSIX path).
+ */
+async function readFilesParallel(paths) {
+  return Promise.all(
+    paths.map(async ({ key, absPath }) => {
+      try {
+        const raw = await readFile(absPath, 'utf-8');
+        return { key, raw, err: null };
+      } catch (err) {
+        return { key, raw: null, err };
+      }
+    }),
+  );
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // skills/understand/ -> plugin root is two dirs up
@@ -180,20 +203,26 @@ function parseTsConfigText(raw) {
  *      where the stripper damaged a string literal containing `//`.
  *   3. If both fail, warn and skip — that tsconfig contributes no aliases.
  */
-function loadTsConfigs(projectRoot, files) {
+async function loadTsConfigs(projectRoot, files) {
   const out = new Map();
+  const warnings = [];
+  // Collect the candidate paths in the original file order before reading,
+  // so warning emit order matches the previous sequential implementation.
+  const candidates = [];
   for (const f of files) {
     const p = toPosix(f.path);
     const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
     if (base !== 'tsconfig.json') continue;
     const absPath = join(projectRoot, p);
     if (!existsSync(absPath)) continue;
-    let raw;
-    try {
-      raw = readFileSync(absPath, 'utf-8');
-    } catch (err) {
-      process.stderr.write(
-        `Warning: extract-import-map: tsconfig.json at ${absPath} failed ` +
+    candidates.push({ key: p, absPath });
+  }
+  const reads = await readFilesParallel(candidates);
+  for (const { key: p, raw, err } of reads) {
+    if (err) {
+      // absPath isn't carried through the helper return shape; reconstruct it.
+      warnings.push(
+        `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
         `to read (${err.message}) — path aliases from this config will ` +
         `not be applied — relative imports unaffected\n`,
       );
@@ -201,8 +230,8 @@ function loadTsConfigs(projectRoot, files) {
     }
     const parsed = parseTsConfigText(raw);
     if (!parsed) {
-      process.stderr.write(
-        `Warning: extract-import-map: tsconfig.json at ${absPath} failed ` +
+      warnings.push(
+        `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
         `to parse — path aliases from this config will not be applied ` +
         `— relative imports unaffected\n`,
       );
@@ -210,7 +239,7 @@ function loadTsConfigs(projectRoot, files) {
     }
     out.set(dirOf(p), parsed);
   }
-  return out;
+  return { configs: out, warnings };
 }
 
 /**
@@ -237,20 +266,26 @@ function loadTsConfigs(projectRoot, files) {
  * The resolver uses each module's prefix to translate
  * `import "github.com/foo/bar/x"` into the project-internal `x/<file>.go`.
  */
-function loadGoModules(projectRoot, files) {
+async function loadGoModules(projectRoot, files) {
   const out = new Map();
+  // loadGoModules currently emits no warnings (read failures are silently
+  // skipped — per-file resolvers surface "no ancestor go.mod" later), but
+  // the `{ data, warnings }` shape matches loadTsConfigs / loadPhpAutoloads
+  // so the concurrent caller in buildResolutionContext can drain them
+  // uniformly in canonical order.
+  const warnings = [];
+  const candidates = [];
   for (const f of files) {
     const p = toPosix(f.path);
     const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
     if (base !== 'go.mod') continue;
     const absPath = join(projectRoot, p);
     if (!existsSync(absPath)) continue;
-    let raw;
-    try {
-      raw = readFileSync(absPath, 'utf-8');
-    } catch {
-      continue;
-    }
+    candidates.push({ key: p, absPath });
+  }
+  const reads = await readFilesParallel(candidates);
+  for (const { key: p, raw, err } of reads) {
+    if (err) continue;
     let moduleName = '';
     for (const line of raw.split(/\r?\n/)) {
       const trimmed = line.replace(/\/\/.*$/, '').trim();
@@ -261,7 +296,102 @@ function loadGoModules(projectRoot, files) {
     if (!moduleName) continue;
     out.set(dirOf(p), moduleName);
   }
-  return out;
+  return { modules: out, warnings };
+}
+
+/**
+ * Parse Swift Package.swift target declarations just enough for import-map
+ * resolution. Swift imports modules, and SwiftPM target names are module names.
+ * The common convention is `Sources/<Target>`, but packages can override the
+ * source directory with `path: "..."`; without this light manifest pass those
+ * custom targets would stay disconnected.
+ *
+ * This is intentionally a focused parser, not a Swift evaluator. It handles
+ * `.target(...)`, `.executableTarget(...)`, and `.testTarget(...)` calls with
+ * literal `name:` and optional literal `path:` arguments.
+ */
+function parseSwiftPackageTargets(raw) {
+  const targets = [];
+  const callRe = /\.(target|executableTarget|testTarget)\s*\(/g;
+  let match;
+
+  while ((match = callRe.exec(raw)) !== null) {
+    const kind = match[1];
+    const bodyStart = callRe.lastIndex;
+    let depth = 1;
+    let i = bodyStart;
+    let inString = false;
+    let quote = '';
+    let escaped = false;
+
+    for (; i < raw.length; i++) {
+      const ch = raw[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === quote) {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === '"' || ch === "'") {
+        inString = true;
+        quote = ch;
+        continue;
+      }
+      if (ch === '(') depth += 1;
+      if (ch === ')') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+
+    const body = raw.slice(bodyStart, i);
+    callRe.lastIndex = i + 1;
+
+    const name = body.match(/\bname\s*:\s*"([^"]+)"/)?.[1];
+    if (!name) continue;
+    const explicitPath = body.match(/\bpath\s*:\s*"([^"]+)"/)?.[1];
+    const defaultRoot = kind === 'testTarget' ? 'Tests' : 'Sources';
+    targets.push({
+      name,
+      path: explicitPath || `${defaultRoot}/${name}`,
+    });
+  }
+
+  return targets;
+}
+
+async function loadSwiftPackageTargets(projectRoot, files) {
+  const targets = new Map();
+  const warnings = [];
+  const candidates = [];
+
+  for (const f of files) {
+    const p = toPosix(f.path);
+    const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
+    if (base !== 'Package.swift') continue;
+    const absPath = join(projectRoot, p);
+    if (!existsSync(absPath)) continue;
+    candidates.push({ key: p, absPath });
+  }
+
+  const reads = await readFilesParallel(candidates);
+  for (const { key: p, raw, err } of reads) {
+    if (err) continue;
+    const packageDir = dirOf(p);
+    for (const target of parseSwiftPackageTargets(raw)) {
+      const targetPath = resolveRelative(packageDir, target.path.replace(/\\/g, '/'));
+      if (!targetPath) continue;
+      if (!targets.has(target.name)) targets.set(target.name, new Set());
+      targets.get(target.name).add(targetPath);
+    }
+  }
+
+  return { targets, warnings };
 }
 
 /**
@@ -306,10 +436,34 @@ function findNearestConfigDir(startDir, configMap) {
  *
  * Build once; pass everywhere.
  */
-function buildResolutionContext(projectRoot, files) {
+async function buildResolutionContext(projectRoot, files) {
   const fileSet = new Set(files.map(f => toPosix(f.path)));
-  const tsConfigs = loadTsConfigs(projectRoot, files);
-  const goModules = loadGoModules(projectRoot, files);
+
+  // These config-loader passes are independent and each does its own
+  // batched parallel I/O; run them concurrently so the wait for a slow
+  // tsconfig.json read doesn't block go.mod / composer.json / SwiftPM scanning.
+  //
+  // Each loader BUFFERS warnings into a private array rather than writing
+  // them to stderr inline. If a loader streamed warnings directly during
+  // the concurrent passes, lines from independent loader families could
+  // interleave based on I/O timing — that would break the pre-PR
+  // deterministic order (ts → go → php → swift) and make stderr-diff verification
+  // flaky. Drain the buffers in canonical order *after* Promise.all, so
+  // a fixture with `(malformed tsconfig.json, malformed composer.json)`
+  // always emits `tsconfig…\ncomposer…\n`, never the reverse.
+  const [tsResult, goResult, phpResult, swiftResult] = await Promise.all([
+    loadTsConfigs(projectRoot, files),
+    loadGoModules(projectRoot, files),
+    loadPhpAutoloads(projectRoot, files),
+    loadSwiftPackageTargets(projectRoot, files),
+  ]);
+  for (const w of tsResult.warnings) process.stderr.write(w);
+  for (const w of goResult.warnings) process.stderr.write(w);
+  for (const w of phpResult.warnings) process.stderr.write(w);
+  for (const w of swiftResult.warnings) process.stderr.write(w);
+  const tsConfigs = tsResult.configs;
+  const goModules = goResult.modules;
+  const phpAutoloads = phpResult.autoloads;
 
   // Index .go files by their parent directory so the Go resolver can
   // expand a package-level import to all member .go files in O(1).
@@ -330,8 +484,7 @@ function buildResolutionContext(projectRoot, files) {
   const javaIndex = buildSuffixIndex(files, p => p.endsWith('.java'));
   const kotlinIndex = buildSuffixIndex(files, p => p.endsWith('.kt'));
   const csIndex = buildSuffixIndex(files, p => p.endsWith('.cs'));
-
-  const phpAutoloads = loadPhpAutoloads(projectRoot, files);
+  const swiftModuleIndex = buildSwiftModuleIndex(files, swiftResult.targets);
 
   return {
     projectRoot,
@@ -342,6 +495,7 @@ function buildResolutionContext(projectRoot, files) {
     javaIndex,
     kotlinIndex,
     csIndex,
+    swiftModuleIndex,
     phpAutoloads,
     // Dedupe Sets for one-time-per-file warnings. Keyed by importer file
     // path. Mutated by resolvers.
@@ -370,14 +524,54 @@ const TS_EXT_PROBES = [
 ];
 
 /**
+ * NodeNext / Node16 / Bundler-with-explicit-extensions ESM TypeScript convention:
+ * TypeScript does NOT rewrite import specifiers during compilation, so source
+ * files import their COMPILED specifier (`./config.js`) even when only
+ * `./config.ts` exists on disk. We map each compiled-output extension to the
+ * TS source extensions that could have produced it, in priority order.
+ *
+ * Without this rewrite, ESM-TS projects (which is now the default for any new
+ * TS project) end up with a near-edgeless knowledge graph because every
+ * project-internal import fails to resolve. (#294)
+ */
+const NODENEXT_REWRITES = {
+  '.js': ['.ts', '.tsx', '.js', '.jsx'],
+  '.jsx': ['.tsx', '.jsx'],
+  '.mjs': ['.mts', '.mjs', '.ts'],
+  '.cjs': ['.cts', '.cjs', '.ts'],
+};
+
+/**
  * Try ext probes against the file set for the given base path. Returns the
  * first matching project-relative path, or null. If the base path already has
  * a code extension AND exists in the file set, returns it directly.
+ *
+ * For NodeNext-style imports (`./foo.js` where only `./foo.ts` exists), apply
+ * the source-extension rewrite — see NODENEXT_REWRITES above.
  */
 function probeWithExtensions(basePath, fileSet) {
   if (!basePath) return null;
-  // Exact match (import already had an extension)
+  // Exact match (import already had an extension that resolves on disk)
   if (fileSet.has(basePath)) return basePath;
+
+  // NodeNext rewrite: if the basePath ends with a compiled-output extension
+  // but no such file exists, try the corresponding source extensions. We do
+  // this BEFORE the legacy "append extensions" loop because for an import
+  // like `./foo.js`, appending `.ts` would produce `foo.js.ts` (always wrong)
+  // while the correct candidate is `foo.ts`.
+  for (const [outExt, srcExts] of Object.entries(NODENEXT_REWRITES)) {
+    if (!basePath.endsWith(outExt)) continue;
+    const stem = basePath.slice(0, -outExt.length);
+    for (const srcExt of srcExts) {
+      const candidate = stem + srcExt;
+      if (fileSet.has(candidate)) return candidate;
+    }
+    // The basePath had an explicit compiled extension — don't fall through
+    // to the "append extensions" loop, which would produce nonsense like
+    // `foo.js.ts`. If NodeNext rewrite didn't find anything, return null.
+    return null;
+  }
+
   for (const ext of TS_EXT_PROBES) {
     const candidate = basePath + ext;
     if (fileSet.has(candidate)) return candidate;
@@ -430,9 +624,18 @@ export function resolveTsJsImport(rawImport, file, ctx) {
           const relativeToConfig = normalizedBase
             ? posix.join(normalizedBase, mapped)
             : mapped;
-          const candidate = tsConfigDir
-            ? posix.join(tsConfigDir, relativeToConfig)
-            : relativeToConfig;
+          // posix.normalize strips a leading "./" left over when both
+          // tsConfigDir and normalizedBase are empty (root tsconfig with
+          // `"@/*": ["./*"]`, the create-next-app default). Without this the
+          // candidate stays as "./foo" while ctx.fileSet stores "foo", and
+          // probeWithExtensions silently drops every cross-module edge.
+          const candidate = posix.normalize(
+            tsConfigDir
+              ? posix.join(tsConfigDir, relativeToConfig)
+              : relativeToConfig,
+          );
+          // Defensive: tsconfig targets shouldn't escape the project root.
+          if (candidate.startsWith('..')) continue;
           const probed = probeWithExtensions(candidate, ctx.fileSet);
           if (probed) return probed;
         }
@@ -819,6 +1022,86 @@ function buildSuffixIndex(files, extPredicate) {
   return idx;
 }
 
+const SWIFT_SOURCE_ROOT_DIRS = new Set(['source', 'sources', 'test', 'tests']);
+const SWIFT_MODULE_CONTAINER_DIRS = new Set([
+  'framework',
+  'frameworks',
+  'library',
+  'libraries',
+  'module',
+  'modules',
+]);
+
+function addSwiftModuleFile(index, moduleName, filePath) {
+  if (!moduleName) return;
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(moduleName)) return;
+  if (!index.has(moduleName)) index.set(moduleName, new Set());
+  index.get(moduleName).add(filePath);
+}
+
+function inferSwiftModulesFromPath(filePath) {
+  const parts = filePath.split('/');
+  const dirs = parts.slice(0, -1);
+  const modules = new Set();
+
+  for (let i = 0; i < dirs.length - 1; i++) {
+    const lower = dirs[i].toLowerCase();
+    if (
+      SWIFT_SOURCE_ROOT_DIRS.has(lower) ||
+      SWIFT_MODULE_CONTAINER_DIRS.has(lower)
+    ) {
+      modules.add(dirs[i + 1]);
+    }
+  }
+
+  if (dirs.length > 0 && !SWIFT_SOURCE_ROOT_DIRS.has(dirs[0].toLowerCase())) {
+    modules.add(dirs[0]);
+  }
+
+  return modules;
+}
+
+/**
+ * Build a Swift module-name -> files index.
+ *
+ * Swift files in the same module do not import each other by relative path;
+ * `import Foo` imports a module. We therefore resolve to every project Swift
+ * file that belongs to module `Foo`, mirroring the Go resolver's package-level
+ * expansion. The index combines SwiftPM manifest targets with common on-disk
+ * conventions (`Sources/Foo`, `Tests/FooTests`, and top-level Xcode groups).
+ */
+function buildSwiftModuleIndex(files, packageTargets) {
+  const idx = new Map();
+  const targetEntries = [...packageTargets.entries()].map(([name, paths]) => [
+    name,
+    [...paths].sort((a, b) => a.localeCompare(b)),
+  ]);
+
+  for (const f of files) {
+    const p = toPosix(f.path);
+    if (!p.endsWith('.swift')) continue;
+    if (p.endsWith('/Package.swift') || p === 'Package.swift') continue;
+
+    for (const [moduleName, targetPaths] of targetEntries) {
+      for (const targetPath of targetPaths) {
+        if (p === targetPath || p.startsWith(`${targetPath}/`)) {
+          addSwiftModuleFile(idx, moduleName, p);
+        }
+      }
+    }
+
+    for (const moduleName of inferSwiftModulesFromPath(p)) {
+      addSwiftModuleFile(idx, moduleName, p);
+    }
+  }
+
+  const out = new Map();
+  for (const [moduleName, paths] of idx.entries()) {
+    out.set(moduleName, [...paths].sort((a, b) => a.localeCompare(b)));
+  }
+  return out;
+}
+
 /**
  * Resolve a dotted-import to a file. `fqn` is the qualified name
  * (`com.example.Foo`); `ext` is the file extension to probe (`.java`,
@@ -871,6 +1154,30 @@ export function resolveKotlinImport(rawImport, _file, ctx) {
 
 export function resolveCSharpImport(rawImport, _file, ctx) {
   return resolveDottedFqn(rawImport, '.cs', ctx.csIndex);
+}
+
+// ---------------------------------------------------------------------------
+// Swift resolver
+//
+// Swift imports modules, not files. `SwiftExtractor` reports the module part
+// as `imp.source` for both `import Foo` and qualified forms such as
+// `import struct Foo.Bar`. If a project module named Foo exists in the Swift
+// module index, map the import to all Swift files in that module.
+// ---------------------------------------------------------------------------
+
+function normalizeSwiftModuleName(rawImport) {
+  if (!rawImport || typeof rawImport !== 'string') return null;
+  const moduleName = rawImport.trim().split('.')[0];
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(moduleName) ? moduleName : null;
+}
+
+export function resolveSwiftImport(rawImport, file, ctx) {
+  const moduleName = normalizeSwiftModuleName(rawImport);
+  if (!moduleName) return [];
+  const matches = ctx.swiftModuleIndex.get(moduleName);
+  if (!matches) return [];
+  const importer = toPosix(file.path);
+  return matches.filter(p => p !== importer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,20 +1326,23 @@ function parseComposerAutoloadText(raw) {
  * at the bad file and skips it. The rest of the project's PHP imports keep
  * resolving via whichever composer.json files parsed cleanly.
  */
-function loadPhpAutoloads(projectRoot, files) {
+async function loadPhpAutoloads(projectRoot, files) {
   const out = new Map();
+  const warnings = [];
+  const candidates = [];
   for (const f of files) {
     const p = toPosix(f.path);
     const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
     if (base !== 'composer.json') continue;
     const absPath = join(projectRoot, p);
     if (!existsSync(absPath)) continue;
-    let raw;
-    try {
-      raw = readFileSync(absPath, 'utf-8');
-    } catch (err) {
-      process.stderr.write(
-        `Warning: extract-import-map: composer.json at ${absPath} failed ` +
+    candidates.push({ key: p, absPath });
+  }
+  const reads = await readFilesParallel(candidates);
+  for (const { key: p, raw, err } of reads) {
+    if (err) {
+      warnings.push(
+        `Warning: extract-import-map: composer.json at ${join(projectRoot, p)} failed ` +
         `to read (${err.message}) — PSR-4 namespace mapping from this ` +
         `composer.json unavailable — PHP imports under this package ` +
         `will not resolve\n`,
@@ -1041,8 +1351,8 @@ function loadPhpAutoloads(projectRoot, files) {
     }
     const parsed = parseComposerAutoloadText(raw);
     if (parsed === null) {
-      process.stderr.write(
-        `Warning: extract-import-map: composer.json at ${absPath} failed ` +
+      warnings.push(
+        `Warning: extract-import-map: composer.json at ${join(projectRoot, p)} failed ` +
         `to parse — PSR-4 namespace mapping unavailable — PHP imports ` +
         `under this package will not resolve\n`,
       );
@@ -1050,7 +1360,7 @@ function loadPhpAutoloads(projectRoot, files) {
     }
     out.set(dirOf(p), parsed);
   }
-  return out;
+  return { autoloads: out, warnings };
 }
 
 /**
@@ -1332,6 +1642,9 @@ function resolveImport(imp, file, ctx) {
   if (lang === 'csharp') {
     return resolveCSharpImport(src, file, ctx);
   }
+  if (lang === 'swift') {
+    return resolveSwiftImport(src, file, ctx);
+  }
   if (lang === 'php') {
     return resolvePhpImport(src, file, ctx);
   }
@@ -1412,8 +1725,10 @@ async function main() {
     );
   }
 
-  // Build resolution context (cached configs)
-  const ctx = buildResolutionContext(projectRoot, files);
+  // Build resolution context (cached configs). The loader pass for the
+  // tsconfig/go.mod/composer.json files inside is parallelised — see
+  // `buildResolutionContext`.
+  const ctx = await buildResolutionContext(projectRoot, files);
 
   const importMap = {};
   let filesWithImports = 0;

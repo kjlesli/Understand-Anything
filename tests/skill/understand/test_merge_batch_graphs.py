@@ -979,11 +979,11 @@ class TestMultiPart(unittest.TestCase):
         import subprocess
         import json as _j
         result = subprocess.run(
-            ["python3", str(_MODULE_PATH), str(self.tmp)],
+            [sys.executable, str(_MODULE_PATH), str(self.tmp)],
             capture_output=True, text=True,
         )
         out_path = self.intermediate / "assembled-graph.json"
-        assembled = _j.loads(out_path.read_text()) if out_path.exists() else {}
+        assembled = _j.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
         return result.returncode, result.stderr, assembled
 
     def test_two_parts_of_one_logical_batch_merge(self) -> None:
@@ -1098,11 +1098,11 @@ class TestUnrecognizedBatchFilename(unittest.TestCase):
         import subprocess
         import json as _j
         result = subprocess.run(
-            ["python3", str(_MODULE_PATH), str(self.tmp)],
+            [sys.executable, str(_MODULE_PATH), str(self.tmp)],
             capture_output=True, text=True,
         )
         out_path = self.intermediate / "assembled-graph.json"
-        assembled = _j.loads(out_path.read_text()) if out_path.exists() else {}
+        assembled = _j.loads(out_path.read_text(encoding="utf-8")) if out_path.exists() else {}
         return result.returncode, result.stderr, assembled
 
     def test_fused_filename_emits_stderr_warning(self) -> None:

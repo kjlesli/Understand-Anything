@@ -13,9 +13,18 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+
+/**
+ * Chunk size for parallel file I/O. Bounded so a 15k-file repo doesn't try
+ * to open every descriptor at once (would hit `EMFILE`) while still keeping
+ * libuv's worker-thread pool saturated. Empirically chosen to keep memory
+ * around tens of MB even when the average file is ~10 KB.
+ */
+const IO_PARALLELISM = 64;
 
 const __filename = fileURLToPath(import.meta.url);
 const PLUGIN_ROOT = resolve(dirname(__filename), '../..');
@@ -57,31 +66,55 @@ async function extractExports(projectRoot, codeFiles) {
   }
 
   const exportsByPath = new Map();
-  for (const file of codeFiles) {
-    const abs = join(projectRoot, file.path);
-    let content;
-    try {
-      content = readFileSync(abs, 'utf-8');
-    } catch (err) {
-      process.stderr.write(
-        `Warning: compute-batches: exports extraction failed for ${file.path} ` +
-        `(read error: ${err.message}) — symbols=[] in neighborMap — ` +
-        `cross-batch edges to this file limited to file-level\n`,
-      );
-      exportsByPath.set(file.path, []);
-      continue;
-    }
-    try {
-      const analysis = registry.analyzeFile(file.path, content);
-      const names = (analysis?.exports || []).map(e => e.name).filter(Boolean);
-      exportsByPath.set(file.path, names);
-    } catch (err) {
-      process.stderr.write(
-        `Warning: compute-batches: exports extraction failed for ${file.path} ` +
-        `(analyze error: ${err.message}) — symbols=[] in neighborMap — ` +
-        `cross-batch edges to this file limited to file-level\n`,
-      );
-      exportsByPath.set(file.path, []);
+
+  // I/O is parallelised in bounded chunks (libuv worker threads handle the
+  // disk reads concurrently) while the actual tree-sitter parse stays on
+  // the main thread, since web-tree-sitter is single-threaded WASM. For a
+  // 15k-file iOS repo (#226), the sequential `readFileSync` loop dominated;
+  // letting reads pipeline drops wall time roughly proportional to the
+  // share of the loop spent waiting on disk.
+  for (let start = 0; start < codeFiles.length; start += IO_PARALLELISM) {
+    const slice = codeFiles.slice(start, start + IO_PARALLELISM);
+
+    // Read every file in the slice concurrently. Errors per file are
+    // captured in-place so a single bad file does not abort the chunk.
+    const reads = await Promise.all(
+      slice.map(async (file) => {
+        const abs = join(projectRoot, file.path);
+        try {
+          const content = await readFile(abs, 'utf-8');
+          return { file, content, readError: null };
+        } catch (err) {
+          return { file, content: null, readError: err };
+        }
+      }),
+    );
+
+    // Serialise the CPU-bound tree-sitter work and the stderr warning emits
+    // so log order remains identical to the previous sequential loop. This
+    // also keeps existing fixture-comparison tests stable.
+    for (const { file, content, readError } of reads) {
+      if (readError) {
+        process.stderr.write(
+          `Warning: compute-batches: exports extraction failed for ${file.path} ` +
+          `(read error: ${readError.message}) — symbols=[] in neighborMap — ` +
+          `cross-batch edges to this file limited to file-level\n`,
+        );
+        exportsByPath.set(file.path, []);
+        continue;
+      }
+      try {
+        const analysis = registry.analyzeFile(file.path, content);
+        const names = (analysis?.exports || []).map(e => e.name).filter(Boolean);
+        exportsByPath.set(file.path, names);
+      } catch (err) {
+        process.stderr.write(
+          `Warning: compute-batches: exports extraction failed for ${file.path} ` +
+          `(analyze error: ${err.message}) — symbols=[] in neighborMap — ` +
+          `cross-batch edges to this file limited to file-level\n`,
+        );
+        exportsByPath.set(file.path, []);
+      }
     }
   }
   return exportsByPath;
@@ -191,6 +224,14 @@ function buildBatchOfMap(allBatches) {
     for (const f of b.files) m.set(f.path, b.batchIndex);
   }
   return m;
+}
+
+function normalizeRelativePathForMatch(pathText) {
+  return pathText
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/\/+/g, '/');
 }
 
 /**
@@ -322,7 +363,7 @@ async function main() {
       }
       const lines = content
         .split('\n')
-        .map(s => s.trim())
+        .map(normalizeRelativePathForMatch)
         .filter(Boolean);
       changedFiles = new Set(lines);
     }
@@ -447,15 +488,18 @@ async function main() {
 
   const MAX_NEIGHBORS = 50;
 
-  // Second-pass: enrich each batch with batchImportData + neighborMap
-  const batches = mergedBareBatches.map(b => {
-    const batchPaths = new Set(b.files.map(f => f.path));
+  // Second-pass: enrich each batch with batchImportData + neighborMap.
+  // `analysisFiles` is usually the full batch. In --changed-files mode, it is
+  // only the changed target set, while batchOf remains the full-graph lookup.
+  const buildBatchPayload = (b, analysisFiles = b.files) => {
+    const analysisPaths = new Set(analysisFiles.map(f => f.path));
     const batchImportData = {};
     const neighborMap = {};
-    for (const f of b.files) {
+    for (const f of analysisFiles) {
       batchImportData[f.path] = (importMap[f.path] || []).slice();
 
-      // 1-hop neighbors: imports out + imported-by in, excluding same batch.
+      // 1-hop neighbors: imports out + imported-by in, excluding files already
+      // emitted for analysis in this payload.
       // Note on truncation: we measure "popularity" by total raw 1-hop neighbor
       // count (rawCount), not kept.length. A widely-imported hub like a logger
       // module may have N>50 inbound imports but, after Louvain + size
@@ -467,7 +511,7 @@ async function main() {
       const inNeighbors = reverseImportMap.get(f.path) || [];
       const all = new Set([...outNeighbors, ...inNeighbors]);
       const rawCount = all.size;
-      const filtered = [...all].filter(p => batchOf.has(p) && !batchPaths.has(p));
+      const filtered = [...all].filter(p => batchOf.has(p) && !analysisPaths.has(p));
 
       let kept = filtered.map(p => ({
         path: p,
@@ -490,12 +534,21 @@ async function main() {
 
       if (kept.length) neighborMap[f.path] = kept;
     }
-    return { batchIndex: b.batchIndex, files: b.files, batchImportData, neighborMap };
-  });
+    return { batchIndex: b.batchIndex, files: analysisFiles, batchImportData, neighborMap };
+  };
+
+  const batches = mergedBareBatches.map(b => buildBatchPayload(b));
 
   let finalBatches = batches;
   if (changedFiles) {
-    finalBatches = batches.filter(b => b.files.some(f => changedFiles.has(f.path)));
+    finalBatches = mergedBareBatches
+      .map(b => {
+        const changedBatchFiles = b.files.filter(f =>
+          changedFiles.has(normalizeRelativePathForMatch(f.path)));
+        if (changedBatchFiles.length === 0) return null;
+        return buildBatchPayload(b, changedBatchFiles);
+      })
+      .filter(Boolean);
     // batchIndex on filtered batches retains the full-graph assignment
     // (the design says neighborMap should still reference unchanged files'
     // full-graph batchIndex). No renumbering.
