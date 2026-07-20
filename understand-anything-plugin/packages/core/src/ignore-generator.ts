@@ -135,12 +135,17 @@ const TEST_PATTERN_GROUPS: Array<{ label: string; patterns: string[] }> = [
     ],
   },
   {
-    // Ruby ecosystems split between two test frameworks with distinct
-    // file-naming conventions: RSpec (`*_spec.rb` under spec/) and
-    // Minitest (`*_test.rb` or `test_*.rb` under test/). The dir rules
-    // catch each convention's top-level home, but individual files
-    // sometimes leak elsewhere (lib/**/*_spec.rb in gem repos, engine
-    // test files under app/**/*_test.rb in Rails engines).
+    // Ruby clusters tests aggressively, matching the C++ shape rather
+    // than Rust's inline convention. Measurement across 10 major Ruby
+    // repos (rails, discourse, homebrew, jekyll, fastlane, rubocop,
+    // ruby, liquid, kamal, rspec-rails) showed a 51% weighted-total
+    // reduction — the highest of any language group. Almost all of
+    // that comes from the newly-added `spec/` dir rule (RSpec's home);
+    // the file globs below add another 5 pp on top by catching
+    // `*_spec.rb` in gem-repo `lib/` trees, Minitest files that leak
+    // outside `test/` in Rails engines, and the ubiquitous
+    // `spec_helper.rb` / `test_helper.rb` / `rails_helper.rb` bootstrap
+    // trio. Hero projects: rubocop (67%), discourse (60%, −5.53M tok).
     label: "Ruby",
     patterns: [
       "**/*_spec.rb",
